@@ -1,0 +1,6 @@
+#!/bin/bash
+pname="aria2c"
+for p in `pgrep $pname`;
+do
+    grep "TMUX=$TMUX" /proc/$p/environ -q && exec $(dirname $0)/nic-speeds.sh $p
+done
