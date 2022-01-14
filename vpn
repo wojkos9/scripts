@@ -1,5 +1,4 @@
 #!/bin/bash
-
 # Guess the outgoing interface from default route
 : ${natiface=$(ip route show to 0/0 | sed -n '/^default/{s/.* dev \([^ ]*\).*/\1/p;q}')}
 
@@ -14,12 +13,12 @@ numeric_arg() {
         name=vpn$x
         adr1=10.0.$x.1
         adr2=10.0.$x.2
+        masq_cmd="POSTROUTING -s $adr2 -o $natiface -j MASQUERADE"
     else
         return 1
     fi
 }
 
-masq_cmd="POSTROUTING -s $adr2 -o $natiface -j MASQUERADE"
 nat_cmd() {
     if [ "$1" = "-s" -o -z "$1" ]; then
         p1=500$x
@@ -44,14 +43,13 @@ up_netns() {
     sudo ip address add $adr1/24 dev $name.1
     sudo ip link set $name.2 netns $name
     sudo ip link set $name.1 up
-    cmds=(
-        "ip address add $adr2/24 dev $name.2;"
-        "ip link set $name.2 up;"
-        "ip route add default via $adr1;"
-        "ip route add 192.168.8.0/24 via $adr1;"
-        "sysctl net.ipv4.ping_group_range='0 2147483647';"
-    )
-    sudo ip netns exec $name sh -c "${cmds[@]}"
+    echo "$cmds"
+    sudo ip netns exec $name sh -c "\
+        ip address add $adr2/24 dev $name.2; \
+        ip link set $name.2 up; \
+        ip route add default via $adr1; \
+        ip route add 192.168.8.0/24 via $adr1; \
+        sysctl net.ipv4.ping_group_range='0 2147483647'"
     sudo iptables -t nat -A $masq_cmd
     sudo cp /etc/resolv.conf /etc/netns/$name/
 }
@@ -62,7 +60,7 @@ proxy_nat() {
 }
 
 print_pids() {
-    ip netns pids $name
+    sudo ip netns pids $name
 }
 
 print_pids_full() {
@@ -72,13 +70,20 @@ print_pids_full() {
 }
 
 kill_pids() {
+    killc=${1-kill}
+    ovpn_pid | xargs sudo kill -9
+    squid_pid | xargs $killc
     for pid in `ip netns pids $name`; do
-        ${1-kill} $pid
+        $killc $pid
     done
 }
 
 forcekill_pids() {
-    kill_pids "sudo kill -9"
+    kill_pids "kill -9"
+}
+
+kill_squid() {
+    is_up $x && kill -9 `cat ~/y/squid/$x/pid`
 }
 
 down_netns() {
@@ -91,7 +96,8 @@ down_netns() {
 }
 
 tmux_setup() {
-    tmux -L "$name" new -s "$name" -d
+    sudo ip netns exec $name su -c "tmux -L $name new -c 'sudo enping' -d" $USER
+    #sudo ip netns exec $name tmux -L "$name" new -s "$name" -d
 }
 
 attach() {
@@ -129,37 +135,57 @@ vpn_run() {
     tmux_do "sudo $d/ovpn/run $conf"
 }
 
-is_up0() {
-    f="$d/squid/${1-$x}/pid"
-    [ ! -f "$f" ] && return 1
-    pf="/proc/`cat $f`"
-    [ ! -e "$pf" ] && return 1
-    [ "`cat $pf/comm`" != "squid" ] && return 1
-    return 0
+check_pid() {
+    pidf="$1"
+    [ -f "$pidf" ] || return 1
+    pid=`cat $pidf`
+    procd="/proc/$pid"
+    [ -e "$procd" ] || return 1
+    [ "`cat $procd/comm`" != "$2" ] && return 1
+    echo $pid
+}
+squid_pid() {
+    check_pid "$d/squid/${1-$x}/pid" "squid"
+}
+
+ovpn_pid() {
+    check_pid "$d/ovpn/${1-$x}.pid" "openvpn"
 }
 
 is_up() {
-    is_up0 $x && echo up || echo down
+    squid_pid > /dev/null
 }
 
 test_ip() {
     fail_msg="$1 -"
-    if is_up0 $1; then
+    if is_up $1; then
         curl -x $adr2:$p_squid ipinfo.io -s --connect-timeout 3 | jq "$1, .country, .ip" | xargs || echo "$1 !"
     else
         echo "$fail_msg"
     fi
 }
 
-test_ips() {
+_one_or_all() {
     if [ -z "$x" ]; then
         for k in ${!vpn_confs[@]}; do
             numeric_arg $k
-            test_ip $k
+            $1 $k
         done
     else
-        test_ip $x
+        $1 $x
     fi
+}
+
+test_ips() {
+    _one_or_all test_ip
+}
+
+is_up_info() {
+    is_up $1 && echo $1 up || echo $1 down
+}
+
+are_up() {
+    _one_or_all is_up_info
 }
 
 all() {
@@ -169,11 +195,6 @@ all() {
     nginx_run
     proxy_nat
     vpn_run
-    trap 'exit' INT
-    while :; do
-        test_ip $x
-        sleep 1
-    done
 }
 
 declare -A fmap
@@ -193,14 +214,16 @@ fmap=(
     [n]=nginx_run
     [x]=proxy_nat
     [v]=vpn_run
-    [a]=force_attach
-    [A]=attach
+    [A]=force_attach
+    [a]=attach
     [e]=all
     [k]=kill_pids
     [K]=forcekill_pids
     [p]=print_pids_full
     [h]=show_help
-    [i]=is_up
+    [i]=are_up
+    [S]=squid_pid
+    [O]=ovpn_pid
 )
 
 for arg in $@
