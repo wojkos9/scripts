@@ -1,0 +1,215 @@
+#!/bin/bash
+
+# Guess the outgoing interface from default route
+: ${natiface=$(ip route show to 0/0 | sed -n '/^default/{s/.* dev \([^ ]*\).*/\1/p;q}')}
+
+d=`dirname $0`
+
+p_squid=3128
+p_nginx=3228
+
+numeric_arg() {
+    if [[ "$1" =~ [0-9]+ ]]; then
+        x=$1
+        name=vpn$x
+        adr1=10.0.$x.1
+        adr2=10.0.$x.2
+    else
+        return 1
+    fi
+}
+
+masq_cmd="POSTROUTING -s $adr2 -o $natiface -j MASQUERADE"
+nat_cmd() {
+    if [ "$1" = "-s" -o -z "$1" ]; then
+        p1=500$x
+        p2=$p_squid
+    elif [ "$1" = "-n" ]; then
+        p1=510$x
+        p2=$p_nginx
+    fi
+    echo "PREROUTING -p tcp --dport $p1 -j DNAT --to-destination $adr2:$p2"
+}
+
+add_rule() {
+    sudo iptables -t nat -A $@
+}
+del_rule() {
+    sudo iptables -t nat -D $@
+}
+
+up_netns() {
+    sudo ip link add $name.1 type veth peer name $name.2
+    sudo ip netns add $name
+    sudo ip address add $adr1/24 dev $name.1
+    sudo ip link set $name.2 netns $name
+    sudo ip link set $name.1 up
+    cmds=(
+        "ip address add $adr2/24 dev $name.2;"
+        "ip link set $name.2 up;"
+        "ip route add default via $adr1;"
+        "ip route add 192.168.8.0/24 via $adr1;"
+        "sysctl net.ipv4.ping_group_range='0 2147483647';"
+    )
+    sudo ip netns exec $name sh -c "${cmds[@]}"
+    sudo iptables -t nat -A $masq_cmd
+    sudo cp /etc/resolv.conf /etc/netns/$name/
+}
+
+proxy_nat() {
+    add_rule `nat_cmd -s`
+    add_rule `nat_cmd -n`
+}
+
+print_pids() {
+    ip netns pids $name
+}
+
+print_pids_full() {
+    for pid in `print_pids`; do
+        echo -e "$pid\t`cat /proc/$pid/cmdline | xargs -0`"
+    done
+}
+
+kill_pids() {
+    for pid in `ip netns pids $name`; do
+        ${1-kill} $pid
+    done
+}
+
+forcekill_pids() {
+    kill_pids "sudo kill -9"
+}
+
+down_netns() {
+    forcekill_pids
+    del_rule $masq_cmd
+    del_rule `nat_cmd -s`
+    del_rule `nat_cmd -n`
+    sudo ip netns del $name
+    sudo ip link del $name.1
+}
+
+tmux_setup() {
+    tmux -L "$name" new -s "$name" -d
+}
+
+attach() {
+    tmux -L $name attach
+}
+
+force_attach() {
+    attach || { tmux_setup; attach; }
+}
+
+tmux_do() {
+    tmux -L $name send-keys "$@" Enter
+}
+
+squid_run() {
+    tmux_do "$d/squid/run $x"
+}
+
+nginx_run() {
+    tmux_do "$d/nginx/run $x"
+}
+
+declare -A vpn_confs
+vpn_confs=(
+    [1]='1 1 us'
+    [2]='2 2 jp'
+    [3]='3 4'
+    [4]='2 5'
+    [5]='1 2')
+
+vpn_run() {
+    conf=${vpn_confs["$x"]}
+    [ $x -eq 0 -o -z "$conf" ] && echo skip v && exit
+    echo $conf
+    tmux_do "sudo $d/ovpn/run $conf"
+}
+
+is_up0() {
+    f="$d/squid/${1-$x}/pid"
+    [ ! -f "$f" ] && return 1
+    pf="/proc/`cat $f`"
+    [ ! -e "$pf" ] && return 1
+    [ "`cat $pf/comm`" != "squid" ] && return 1
+    return 0
+}
+
+is_up() {
+    is_up0 $x && echo up || echo down
+}
+
+test_ip() {
+    fail_msg="$1 -"
+    if is_up0 $1; then
+        curl -x $adr2:$p_squid ipinfo.io -s --connect-timeout 3 | jq "$1, .country, .ip" | xargs || echo "$1 !"
+    else
+        echo "$fail_msg"
+    fi
+}
+
+test_ips() {
+    if [ -z "$x" ]; then
+        for k in ${!vpn_confs[@]}; do
+            numeric_arg $k
+            test_ip $k
+        done
+    else
+        test_ip $x
+    fi
+}
+
+all() {
+    up_netns
+    tmux_setup
+    squid_run
+    nginx_run
+    proxy_nat
+    vpn_run
+    trap 'exit' INT
+    while :; do
+        test_ip $x
+        sleep 1
+    done
+}
+
+declare -A fmap
+
+show_help() {
+    for k in "${!fmap[@]}"; do
+        echo $k - ${fmap[$k]}
+    done
+}
+
+fmap=(
+    [u]=up_netns
+    [d]=down_netns
+    [t]=tmux_setup
+    [T]=test_ips
+    [s]=squid_run
+    [n]=nginx_run
+    [x]=proxy_nat
+    [v]=vpn_run
+    [a]=force_attach
+    [A]=attach
+    [e]=all
+    [k]=kill_pids
+    [K]=forcekill_pids
+    [p]=print_pids_full
+    [h]=show_help
+    [i]=is_up
+)
+
+for arg in $@
+do
+    numeric_arg $arg && continue
+    f=${fmap["$arg"]}
+    if [ ! -z "$f" ]; then
+        "$f" || { echo "return 1"; exit 1; }
+    else
+        echo "Not found: \"$arg\""
+    fi
+done
