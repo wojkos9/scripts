@@ -1,0 +1,7 @@
+#!/bin/sh
+pkgname=${@:(-2):1}
+apkname=${@: -1}
+args=${@:1:$#-2}
+adb $args shell pm list packages | grep $pkgname | cut -d: -f 2 \
+  | xargs adb $args shell pm path | head -1 | cut -d: -f 2 \
+  | xargs -I{} adb $args pull {} $apkname
